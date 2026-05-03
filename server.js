@@ -86,16 +86,68 @@ function signUser(user) {
   );
 }
 
+function hasUsefulRemoteValue(value) {
+  return value !== null && value !== undefined && value !== '';
+}
+
+function preserveRemoteArcgisState(existingDatos = {}, incomingDatos = {}) {
+  const merged = { ...incomingDatos };
+  const preservedKeys = [
+    'remote_object_id',
+    'global_id_remoto',
+    'estado_sync_arcgis',
+    'ultimo_sync_arcgis',
+    'error_arcgis',
+  ];
+
+  for (const key of preservedKeys) {
+    if (!hasUsefulRemoteValue(merged[key]) && hasUsefulRemoteValue(existingDatos[key])) {
+      merged[key] = existingDatos[key];
+    }
+  }
+
+  return merged;
+}
+
+async function enrichArcgisPayload(tabla, usuarioId, item) {
+  if (tabla !== 'collars') return item;
+
+  const proyectoUuid = item.proyecto_uuid || item.proyectoUuid || item.project_uuid || item.projectUuid;
+  if (!proyectoUuid) return item;
+
+  const r = await pool.query(
+    `SELECT id, datos FROM proyectos WHERE id = $1 AND usuario_id = $2`,
+    [String(proyectoUuid), usuarioId],
+  );
+  const projectRow = r.rows[0];
+  if (!projectRow) {
+    console.warn(`[arcgis] collar ${item.id} referencia proyecto ${proyectoUuid}, pero no existe en PostgreSQL para este usuario.`);
+    return item;
+  }
+
+  return {
+    ...item,
+    _project: {
+      id: projectRow.id,
+      uuid: projectRow.id,
+      ...projectRow.datos,
+    },
+  };
+}
+
 function replicarArcgisAsync(tabla, usuarioId, item) {
-  pushFeature(tabla, item)
+  enrichArcgisPayload(tabla, usuarioId, item)
+    .then((payload) => pushFeature(tabla, payload))
     .then(async (remote) => {
       if (!remote) return;
       const patch = {
         remote_object_id: remote.objectId,
-        global_id_remoto: remote.globalId,
         estado_sync_arcgis: 'sincronizado',
         ultimo_sync_arcgis: new Date().toISOString(),
       };
+      if (hasUsefulRemoteValue(remote.globalId)) {
+        patch.global_id_remoto = remote.globalId;
+      }
       await pool.query(
         `UPDATE ${tabla} SET datos = datos || $1::jsonb WHERE id = $2 AND usuario_id = $3`,
         [JSON.stringify(patch), String(item.id), usuarioId],
@@ -121,15 +173,21 @@ async function upsertRegistro(tabla, usuarioId, item) {
   const constraint = PRIMARY_KEY_CONSTRAINTS[tabla];
   if (!constraint) throw new Error(`Tabla no soportada: ${tabla}`);
 
+  const existing = await pool.query(
+    `SELECT datos FROM ${tabla} WHERE id = $1 AND usuario_id = $2`,
+    [String(id), usuarioId],
+  );
+  const datosParaGuardar = preserveRemoteArcgisState(existing.rows[0]?.datos || {}, datos);
+
   await pool.query(
     `INSERT INTO ${tabla} (id, usuario_id, datos, actualizado_en)
      VALUES ($1, $2, $3, NOW())
      ON CONFLICT ON CONSTRAINT ${constraint} DO UPDATE
      SET datos = EXCLUDED.datos, actualizado_en = NOW()`,
-    [String(id), usuarioId, datos],
+    [String(id), usuarioId, datosParaGuardar],
   );
 
-  replicarArcgisAsync(tabla, usuarioId, { id, ...datos });
+  replicarArcgisAsync(tabla, usuarioId, { id, ...datosParaGuardar });
   return true;
 }
 
