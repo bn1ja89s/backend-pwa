@@ -17,4 +17,4 @@ npm install
 npm start
 ```
 
-El servidor expone `http://localhost:3001` y crea las tablas necesarias si no existen.
+El servidor expone `https://backend-pwa-production.up.railway.app` y crea las tablas necesarias si no existen.
