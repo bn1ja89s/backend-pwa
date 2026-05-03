@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const { pushFeature } = require('./arcgisReplicator');
 
 const app = express();
 const pool = new Pool({
@@ -85,6 +86,35 @@ function signUser(user) {
   );
 }
 
+function replicarArcgisAsync(tabla, usuarioId, item) {
+  pushFeature(tabla, item)
+    .then(async (remote) => {
+      if (!remote) return;
+      const patch = {
+        remote_object_id: remote.objectId,
+        global_id_remoto: remote.globalId,
+        estado_sync_arcgis: 'sincronizado',
+        ultimo_sync_arcgis: new Date().toISOString(),
+      };
+      await pool.query(
+        `UPDATE ${tabla} SET datos = datos || $1::jsonb WHERE id = $2 AND usuario_id = $3`,
+        [JSON.stringify(patch), String(item.id), usuarioId],
+      );
+      console.log(`[arcgis] ${tabla} ${item.id} replicado (objectId=${remote.objectId})`);
+    })
+    .catch(async (err) => {
+      console.error(`[arcgis] replicación falló ${tabla} ${item.id}:`, err.message);
+      try {
+        await pool.query(
+          `UPDATE ${tabla} SET datos = datos || $1::jsonb WHERE id = $2 AND usuario_id = $3`,
+          [JSON.stringify({ estado_sync_arcgis: 'error', error_arcgis: err.message }), String(item.id), usuarioId],
+        );
+      } catch (e) {
+        console.error('[arcgis] no se pudo guardar el error:', e.message);
+      }
+    });
+}
+
 async function upsertRegistro(tabla, usuarioId, item) {
   const { id, ...datos } = item;
   if (!id) return false;
@@ -98,6 +128,8 @@ async function upsertRegistro(tabla, usuarioId, item) {
      SET datos = EXCLUDED.datos, actualizado_en = NOW()`,
     [String(id), usuarioId, datos],
   );
+
+  replicarArcgisAsync(tabla, usuarioId, { id, ...datos });
   return true;
 }
 
@@ -261,5 +293,31 @@ app.post('/sync/completa', auth, async (req, res) => {
   }
 });
 
+app.post('/admin/replicar-arcgis/:tabla', auth, async (req, res) => {
+  const { tabla } = req.params;
+  if (!['proyectos', 'collars', 'surveys', 'assays'].includes(tabla)) {
+    return res.status(400).json({ error: 'Tabla no soportada para replicación ArcGIS' });
+  }
+
+  try {
+    const r = await pool.query(
+      `SELECT id, datos FROM ${tabla} WHERE usuario_id = $1`,
+      [req.user.id],
+    );
+
+    let lanzados = 0;
+    for (const row of r.rows) {
+      const yaSync = row.datos?.remote_object_id || row.datos?.global_id_remoto;
+      if (yaSync && req.query.force !== '1') continue;
+      replicarArcgisAsync(tabla, req.user.id, { id: row.id, ...row.datos });
+      lanzados++;
+    }
+
+    res.json({ ok: true, total: r.rows.length, lanzados });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 const port = process.env.PORT || 3001;
-app.listen(port, () => console.log(`Backend en http://localhost:${port}`));
+app.listen(port, '0.0.0.0', () => console.log(`Backend en http://localhost:${port}`));
